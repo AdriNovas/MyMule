@@ -158,6 +158,80 @@ func TestResultCacheWaiterRunsItselfWhenLeaderFails(t *testing.T) {
 	}
 }
 
+// A search that panics (net/http recovers it) must not stay in flight:
+// the request waiting for it runs the search itself, and later requests
+// for the same search are answered instead of waiting forever.
+func TestResultCacheSurvivesPanickingSearch(t *testing.T) {
+	c := &resultCache{}
+	release := make(chan struct{})
+	started := make(chan struct{})
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }()
+		c.do(context.Background(), "k", func() ([]tzItem, bool, error) {
+			close(started)
+			<-release
+			panic("boom")
+		})
+	}()
+	<-started
+	done := make(chan []tzItem, 1)
+	go func() {
+		items, _ := c.do(context.Background(), "k", func() ([]tzItem, bool, error) {
+			return []tzItem{{cat: catMovies}}, true, nil
+		})
+		done <- items
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	if p := <-panicked; p != "boom" {
+		t.Fatalf("the panic was not passed on: %v", p)
+	}
+	select {
+	case items := <-done:
+		if len(items) != 1 {
+			t.Fatalf("waiter got %d items", len(items))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter never answered")
+	}
+
+	// A later request for the same search: no flight left behind.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	items, err := c.do(ctx, "k", func() ([]tzItem, bool, error) {
+		t.Error("the cached answer was not used")
+		return nil, false, nil
+	})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("later request: %d items, %v", len(items), err)
+	}
+	c.mu.Lock()
+	left := len(c.flights)
+	c.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d flights left behind", left)
+	}
+}
+
+// A request that comes after a panic, with no other request around, runs
+// the search again instead of waiting on the dead flight.
+func TestResultCacheRetriesAfterPanic(t *testing.T) {
+	c := &resultCache{}
+	func() {
+		defer func() { recover() }()
+		c.do(context.Background(), "k", func() ([]tzItem, bool, error) { panic("boom") })
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	items, err := c.do(ctx, "k", func() ([]tzItem, bool, error) {
+		return []tzItem{{cat: catTV}}, true, nil
+	})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("after a panic: %d items, %v", len(items), err)
+	}
+}
+
 func TestTorznabFailedSearchIsNotCached(t *testing.T) {
 	fx := newFixture(t)
 	fail := true
