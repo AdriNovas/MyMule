@@ -2,6 +2,7 @@ package arr
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -76,25 +77,36 @@ func (c *resultCache) do(ctx context.Context, key string, fn func() (items []tzI
 			}
 			continue
 		}
-		f := &flight{done: make(chan struct{})}
+		// Failed until fn returns: if fn panics, the waiters retry
+		// instead of taking an empty answer.
+		f := &flight{done: make(chan struct{}), err: errSearchAborted}
 		if c.flights == nil {
 			c.flights = map[string]*flight{}
 		}
 		c.flights[key] = f
 		c.mu.Unlock()
 
-		f.items, f.ok, f.err = fn()
-
-		c.mu.Lock()
-		delete(c.flights, key)
-		if f.err == nil && f.ok {
-			if c.data == nil || len(c.data) >= resultCacheLimit {
-				c.data = map[string]cacheEntry{}
-			}
-			c.data[key] = cacheEntry{items: f.items, at: c.clock()}
-		}
-		c.mu.Unlock()
-		close(f.done)
+		func() {
+			// Deferred, so that a panic in fn (net/http recovers it and
+			// MyMule goes on) does not leave the flight behind, with every
+			// later request for the same search waiting on it.
+			defer func() {
+				c.mu.Lock()
+				delete(c.flights, key)
+				if f.err == nil && f.ok {
+					if c.data == nil || len(c.data) >= resultCacheLimit {
+						c.data = map[string]cacheEntry{}
+					}
+					c.data[key] = cacheEntry{items: f.items, at: c.clock()}
+				}
+				c.mu.Unlock()
+				close(f.done)
+			}()
+			f.items, f.ok, f.err = fn()
+		}()
 		return f.items, f.err
 	}
 }
+
+// errSearchAborted is the answer of a search whose fn did not return.
+var errSearchAborted = errors.New("search did not finish")
